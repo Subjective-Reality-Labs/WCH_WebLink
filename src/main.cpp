@@ -51,7 +51,6 @@ PersWiFiManagerAsync persWM(server, dns_server);
 
 const char *config_file = "/config.json";
 
-char ws_message_buffer[64];
 String device_id;
 bool AP_active = false;
 
@@ -359,7 +358,7 @@ void webServerSetup() {
 
   server.on("/reboot", HTTP_GET, [](AsyncWebServerRequest *request) { 
     request->send(200, "text/plain", "OK");
-    persWM.resetSettings();
+    // persWM.resetSettings();
     ESP.restart();
   });
 
@@ -790,7 +789,6 @@ void loop()
     lastCleanup = millis();
     delay(1);
   }
-  ws_message_buffer[0] = '\0';
   if (terminal.connected) {
     uint32_t buf_len = strlen(terminal.buf);
     if (millis() - terminal.last_send_time >= config.poll_delay && buf_len > 1) {
