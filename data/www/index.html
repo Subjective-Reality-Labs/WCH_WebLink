@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html class="preload-transitions">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <title>WCH WebLink</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="wifi" content="%WIFI%"/>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      media="screen"
+      href="styles/style.css"
+    />
+    <link rel="apple-touch-icon" href="images/icon.png"/>
+    <link rel="icon" sizes="32x32" type="image/png" href="images/icon.png" />
+  </head>
+  <body class="preload-transitions">
+    <div class="updater">
+      <div class="top-cell">
+        <div class="terminal closed">
+          <button class="but connect">connect to the terminal</button>
+          <textarea readonly="yes" class="terminal-text" id="terminal"></textarea>
+          <div class="terminal-controls hidden"><input type="text" id="terminal-input"><button id="terminal-send">send</button><button id="terminal-scroll">s</button><button id="terminal-close">x</button></div>
+        </div>
+      </div>
+      <div class="middle-cell">
+          <div class="file-container">
+            <input type="file" id="firmware_file" class="file-input"/>
+            <label for="firmware_file" class="file-label">Select binary</label>
+          </div>
+        <button class="but flash hidden"><span>flash</span></button>
+      </div>
+      <div class="bottom-cell">
+        <div class="micro closed out">
+          <div class="content hidden">
+            <div class="set-lbl">
+              <input type="checkbox" id="custom-hex-check" class="" />
+              <label for="custom-hex-check">Custom HEX</label>
+            </div>
+            <input
+              type="text"
+              minlength="2"
+              pattern="[a-fA-F\d]+"
+              name="custom-hex"
+              id="custom-hex"
+              class="hidden"
+              style="margin-top: 1.5rem; margin-bottom: 0;"
+            />
+            <label class="set-lbl" for="offset">Offset:</label>
+            <div class="group-horizontal">
+              <input
+                type="text"
+                pattern="[xXa-fA-F\d]+"
+                maxlength="11"
+                name="offset"
+                id="offset"
+                class="setting"
+                placeholder="0x08000000"
+                style="margin-right: 1rem;"
+              />
+              <div class="custom-select" id="select-offset">
+                <input name="item" type="radio" id="flash" title="flash" checked/>
+                <input name="item" type="radio" id="bootloader" title="bootloader"/>
+                <input name="item" type="radio" id="option" title="option"/>
+                <input name="item" type="radio" id="ram" title="ram"/>
+                <input name="item" type="radio" id="custom" title="custom"/>
+                <div class="custom-select-labels">
+                  <label name="item" for="flash">flash</label>
+                  <label name="item" for="bootloader">bootloader</label>
+                  <label name="item" for="option">option</label>
+                  <label name="item" for="ram">ram</label>
+                  <label name="item" for="custom">custom</label>
+                </div>
+              </div>
+            </div>
+            <div class="group-horizontal">
+              <button class="but" id="reset">reboot</button>
+              <button class="but" id="unbrick">unbrick</button>
+            </div>
+          </div>
+        </div>
+        <div class="micro clone"></div>
+      </div>
+    </div>
+    <div class="settings hide" id="settings">
+      <div class="set-buttons">
+        <button class="wifi but">wifi</button>
+        <button class="set but">settings</button> 
+      </div>
+      <div class="cards">
+        <div class="set card">
+          <div class="content">
+            <div class="set-lbl">
+              <input type="checkbox" id="uart" class="setting" />
+              <label for="uart">Use UART</label>
+            </div>
+              <label for="swio_pin" class="set-lbl">SWIO pin:</label>
+              <input
+                type="text"
+                minlength="1"
+                maxlength="2"
+                pattern="-?[0-9]+"
+                id="swio_pin"
+                class="setting"
+              />
+              <label for="t1coeff" class="set-lbl">t1coeff:</label>
+              <input
+                type="text"
+                minlength="1"
+                maxlength="3"
+                pattern="[0-9]+"
+                size="3"
+                id="t1coeff"
+                class="setting"
+              />
+              <label for="pin3v3" class="set-lbl">3.3V control pin:</label>
+              <input
+                type="text"
+                minlength="1"
+                maxlength="2"
+                pattern="-?[0-9]+"
+                id="pin3v3"
+                class="setting"
+              />
+              <label for="poll_delay" class="set-lbl">Terminal polling delay:</label>
+              <input
+                type="text"
+                minlength="1"
+                maxlength="5"
+                pattern="[0-9]+"
+                id="poll_delay"
+                class="setting"
+              />
+            <div class="set-lbl">
+              <input type="checkbox" id="load_full" class="setting-local" />
+              <label for="load_full">Load full version</label>
+            </div>
+          </div>
+          
+          <div class="confirm-buttons">
+            <button class="but save">save</button>
+          </div>
+        </div>
+        <div class="wifi card hidden-down">
+          <div class="content">
+            <button class="but wifi-current"></button>
+            <!-- <div class="wifi-current">
+              <h2>Current connection:</h2>
+              <h2></h2>
+            </div> -->
+            <div class="wifi-connect">
+              <div class="title">
+                <img src="images/rescan.svg" class="reload-icon" />
+                <h3>Scan for networks</h3>
+              </div>
+              <div class="networks"></div>
+              <p class="manual">Add manually</p>
+            </div>
+            <div class="more">
+              <button id="advanced-opt-wif"></button>
+              <label for="advanced-opt-wifi">Hotspot options</label>
+            </div>
+            <div class="more-div">
+              <label class="set-lbl" for="wifi:hotspot_name"
+                >Hotspot name:</label
+              >
+              <input
+                type="text"
+                minlength="3"
+                maxlength="32"
+                size="3"
+                name="hotspot_name"
+                id="wifi:hotspot_name"
+                class="setting"
+              />
+              <label class="set-lbl" for="wifi:hotspot_password"
+                >Hotspot password:</label
+              >
+              <input
+                type="password"
+                minlength="8"
+                maxlength="63"
+                size="3"
+                name="hotspot_password"
+                id="wifi:hotspot_password"
+                class="setting"
+              />
+            </div>
+          </div>
+          <div class="confirm-buttons">
+            <button class="but save">save</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="popup-container">
+      <div class="popup">
+        <div class="confirm-buttons">
+        </div>
+        <div class="content"></div>
+      </div>
+    </div>
+    <div class="about">
+      <p id="sw_version">v.1.0</p>
+    </div>
+    <div class="settings-button"></div>
+    <script type="module" src="js/index.js"></script>
+  </body>
+</html>

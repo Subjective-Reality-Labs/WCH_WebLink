@@ -1,0 +1,6 @@
+.pio
+.vscode
+test
+test_binary
+src/WCHLinkS.h
+src/helpers.h
