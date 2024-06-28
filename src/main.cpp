@@ -410,6 +410,10 @@ int initLink() {
   strcpy(terminal.buf, "#");
   ResetInternalProgrammingState(&link_state);
   pinMode(config.swio_pin, OUTPUT_OPEN_DRAIN);
+  #ifdef R_GLITCH_HIGH
+  gpio_set_drive_capability((gpio_num_t)config.swio_pin, GPIO_DRIVE_CAP_0);
+  #endif
+  
   if (config.pin3v3 >= 0) {
     pinMode(config.pin3v3, OUTPUT);
     digitalWrite(config.pin3v3, HIGH);
