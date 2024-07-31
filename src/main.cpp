@@ -327,10 +327,14 @@ void webServerSetup() {
     request->send(200, "text/plain", String(ESP.getFreeHeap())); });
   
   server.on("/reset", HTTP_GET, [](AsyncWebServerRequest *request) { 
-    HaltMode(&link_state, 1);
-    delay(10);
-    Serial.println("Reset the board");
-    request->send(200, "text/plain", "OK");
+    Serial.println("Resetting the board");
+    if(initLink() < 1) {
+      request->send(200, "text/plain", "Failed to init");
+    } else {
+      HaltMode(&link_state, 1);
+      delay(10);
+      request->send(200, "text/plain", "OK");
+    }
   });
   
   server.on("/unbrick", HTTP_GET, [](AsyncWebServerRequest *request) { 
