@@ -70,6 +70,8 @@ struct Flasher {
   char message[64];
   SRLUpdateError_t error;
   SRLUpdateStatus_t status;
+  uint8_t retries = 0;
+  uint8_t current_retry = 0;
 } flasher;
 
 TaskHandle_t PollTask;
@@ -184,11 +186,34 @@ void onFlashUpload(AsyncWebServerRequest *request, String filename, size_t index
         upload_error = false;
         flasher.will_flash = true;
         flasher.status = UPDATING;
+        flasher.current_retry = 0;
+        if (request->hasParam("retries", true)) {
+          flasher.retries = request->getParam("retries", true)->value().toInt();
+        } else {
+          flasher.retries = 0;
+        }
         Serial.println("Will flash");
         link_events.send("Will flash", "flasher", millis());
       }
       return;
     }
+}
+
+void onStatus(AsyncWebServerRequest *request) {
+  char reply[64];
+  if (flasher.status == IDLE) {
+    request->send(200, "text/plain", "Idle");
+  } else if (flasher.status == UPLOADING) {
+    request->send(200, "text/plain", "Uploading binary");
+  } else if (flasher.status == UPDATING) {
+    sprintf(reply, "Flashing in progress. Retry: %u", flasher.current_retry);
+    // %" PRIu32 "
+    request->send(200, "text/plain", reply);
+  } else if (flasher.status == FAILED) {
+    request->send(200, "text/plain", "Flashing failed");
+  } else if (flasher.status == SUCCESS) {
+    request->send(200, "text/plain", "Successfully flashed");
+  }
 }
 
 void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len)
@@ -330,6 +355,8 @@ void webServerSetup() {
   });
 
   server.on("/flash", HTTP_POST, onFlashRequest, onFlashUpload);
+
+  server.on("/status", HTTP_GET, onStatus);
 
   server.on("/", HTTP_ANY, [](AsyncWebServerRequest *request) { 
     // request->send(LittleFS, "/www/index.html");
@@ -636,7 +663,11 @@ void handleFlasher() {
   }
   if (flasher.will_flash) {
     flasher.will_flash = false;
-    int flash_result = writeBinary(flasher.offset, flasher.size);
+    int flash_result;
+    for (flasher.current_retry = 0; flasher.current_retry <= flasher.retries; flasher.current_retry++) {
+      flash_result = writeBinary(flasher.offset, flasher.size);
+      if (!flash_result) break;
+    }
     if (flash_result) {
       if (flash_result == -2) {
         strcpy(flasher.message, "Link init failed");  
