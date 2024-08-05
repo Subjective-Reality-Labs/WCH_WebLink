@@ -354,7 +354,7 @@ void onFlasherEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEve
   case WS_EVT_CONNECT:
     // client connected
     Serial.printf("ws[%s][%u] flasher connect\n\r", server->url(), client->id());
-    client->printf("Welcome to WebLink flasher. Your id is %u" PRIu32 " :)", client->id());
+    client->printf("Welcome to WebLink flasher. Your id is %" PRIu32 "", client->id());
     break;
   case WS_EVT_DISCONNECT:
     // client disconnected
@@ -406,6 +406,7 @@ void onFlasherEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEve
           case 'b': //reBoot
             flasher_ws.current_command = WLF_RESET;
             HaltMode(&link_state, HALT_MODE_REBOOT);
+            client->text("#0;Reboted");
             resetFlasher();
             break;
           case 'B': //reBoot into Bootloader
@@ -524,7 +525,6 @@ void onFlasherEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEve
             break;
           case 'r':
             flasher_ws.current_command = WLF_READ;
-            client->printf("#8;Unimplemented");
             token = strtok(buffer, ";");
             token = strtok(NULL, ";");
             if (token == NULL) {
@@ -1095,6 +1095,7 @@ void handleFlasher() {
   } else if (flasher.will_read) {
     flasher.will_read = false;
     flasher.watchdog = millis();
+    HaltMode(&link_state, HALT_MODE_HALT_BUT_NO_RESET);
     int read_result = ReadBinaryBlob(&link_state, flasher.offset, flasher.size, binary_buf);
     if (read_result) {
       Serial.println("Failed to read flash");
@@ -1102,8 +1103,12 @@ void handleFlasher() {
         flasher_ws.client->text("#4;Failed to read flash");
       }
     } else {
-      if (flasher_ws.active) flasher_ws.client->binary(binary_buf, flasher.size);
+      if (flasher_ws.active) {
+        flasher_ws.client->binary(binary_buf, flasher.size);
+        flasher_ws.client->text("#0;Download complete");
+      }
     }
+    HaltMode(&link_state, HALT_MODE_RESUME);
     resetFlasher();
   }
 }
