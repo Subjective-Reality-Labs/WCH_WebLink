@@ -46,7 +46,12 @@ Response codes are:
 #8 - command unimplemented
 #9 - unknown command
 ```
+Second WebSocket endpoint ``/terminal`` is used whitin Web UI to interact with the terminal, but it also can be used directly. Incomming messages should be sent as text and start with ``#``, other will be ignored. Outgoing messages are in binary format (for some reason I've had errors of corrupted UTF-8 in browser) and also start with ``#``. Terminal is polled with a delay that can be adjusted in settings in the Web UI, default is 1000ms.
+
 **Note:** when a client sends a command to ``/wsflash`` all connections to ``/terminal`` are closed.
+
+Both endpoints serve only 2 clients at a time, next new client will close the oldest one.
+
 # Limitations and known issues
 - Tested on ESP32-C3 and base ESP32 only, other version _should_ work, but untested. If you will use one please add a suitable entry to ``platformio.ini`` if there is a need for any additional options.
 - Base ESP32 better handles terminal connection but may have some trouble while flashing, ESP32-C3 seems to be much more stable with flashing but sometimes skips characters in the terminal.
