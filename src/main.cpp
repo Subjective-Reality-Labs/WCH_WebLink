@@ -161,7 +161,7 @@ void onFlashRequest(AsyncWebServerRequest *request) {
     Serial.println("Upload failed");
     upload_post_error = false;
   }
-};
+}
 
 void resetFlasher() {
   flasher.active = false;
@@ -177,6 +177,7 @@ void resetFlasher() {
 }
 
 void activateFlasher(bool ws = false) {
+  terminalDisconnect();
   flasher.active = true;
   flasher_ws.active = ws;
   flasher.watchdog = millis();
@@ -290,18 +291,23 @@ void onTerminalEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEv
   case WS_EVT_CONNECT:
     // client connected
     Serial.printf("ws[%s][%u] connect\n\r", server->url(), client->id());
-    client->printf("Hello Client %u" PRIu32 " :)", client->id());
-    if (config.uart == false){
-      if (initLink() > 0) {
-        terminal.connected = true;
+    if (!flasher.active || !flasher_ws.active) {
+      client->printf("Hello Client %u" PRIu32 " :)", client->id());
+      if (config.uart == false){
+        if (initLink() > 0) {
+          terminal.connected = true;
+        } else {
+          terminal.connected = false;
+          client->printf("Failed to connect to ch32v003");
+          client->close();
+        }
       } else {
-        terminal.connected = false;
-        client->printf("Failed to connect to ch32v003");
-        client->close();
+        terminal.connected = true;
+        Serial.println("Using UART for terminal");
       }
     } else {
-      terminal.connected = true;
-      Serial.println("Using UART for terminal");
+      client->text("Can't use terminal flasher is active");
+      client->close();
     }
     break;
   case WS_EVT_DISCONNECT:
@@ -370,7 +376,9 @@ void onFlasherEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEve
       Serial.printf("ws[%s][%" PRIu32 "] %s-message[%llu]: ", server->url(), client->id(), (info->opcode == WS_TEXT) ? "text" : "binary", info->len);
       if (info->opcode == WS_TEXT) {
         Serial.printf("%s\n\r", (char *)data);
-        char buffer[64];
+        char buffer[74];
+        char* token;
+        uint32_t datareg, value;
         strncpy(buffer, (char *)data, 64);
         // Serial.println(buffer);
         if (buffer[0] == '#') {
@@ -449,8 +457,6 @@ void onFlasherEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEve
             client->text("#8;Unimplemented");
             resetFlasher();
           case 's':
-            char* token;
-            uint32_t datareg, value;
             flasher_ws.current_command = WLF_DEBUG;
             token = strtok(buffer, ";");
             token = strtok(NULL, ";");
@@ -471,9 +477,7 @@ void onFlasherEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEve
             client->text("#0;Register written");
             resetFlasher();
             break;
-          case 'm':
-            char* token;
-            uint32_t datareg, value;
+          case 'm': {
             flasher_ws.current_command = WLF_DEBUG;
             token = strtok(buffer, ";");
             token = strtok(NULL, ";");
@@ -486,9 +490,8 @@ void onFlasherEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEve
             int ret = MCFReadReg32(&link_state, datareg, &value);
             client->printf("#0;%" PRIu32 ";%" PRIu32 ";%d", datareg, value, ret);
             resetFlasher();
-            break;
+            } break;
           case 'w':
-            char* token;
             token = strtok(buffer, ";");
             token = strtok(NULL, ";");
             if (token == NULL) {
@@ -522,8 +525,6 @@ void onFlasherEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEve
           case 'r':
             flasher_ws.current_command = WLF_READ;
             client->printf("#8;Unimplemented");
-
-            char* token;
             token = strtok(buffer, ";");
             token = strtok(NULL, ";");
             if (token == NULL) {
@@ -558,7 +559,6 @@ void onFlasherEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEve
             break;
           case 'i':
             flasher_ws.current_command = WLF_INFO;
-            char buffer[74];
             if (chipInfo(buffer)) {
               Serial.println("Failed to read info");
               client->printf("#4;Failed to read info");
@@ -1064,13 +1064,13 @@ void handleFlasher() {
       flasher.error = WLF_UPDATER_ERROR;
       flasher.status = WLF_FAILED;
     } else {
-      sprintf(flasher.message, "Flashed succesfully");
+      sprintf(flasher.message, "Flashed successfully");
       flasher.status = WLF_SUCCESS;
     }
     Serial.println(flasher.message);
     link_events.send(flasher.message, "flasher", millis());
     // if (flasher_ws.active) flasher_ws.client->text(flasher.message);
-    if (flasher_ws.active) flasher_ws.client->printf("#%d;%s;", flash_result?0:4, flasher.message);
+    if (flasher_ws.active) flasher_ws.client->printf("#%d;%s", flash_result?4:0, flasher.message);
     resetFlasher();
   } else if (flasher.will_unbrick) {
     flasher.will_unbrick = false;
@@ -1090,7 +1090,7 @@ void handleFlasher() {
     }
     link_events.send(flasher.message, "flasher", millis());
     Serial.println(flasher.message);
-    if (flasher_ws.active) flasher_ws.client->printf("#%d;%s;", r?0:4, flasher.message);
+    if (flasher_ws.active) flasher_ws.client->printf("#%d;%s", r?4:0, flasher.message);
     resetFlasher();
   } else if (flasher.will_read) {
     flasher.will_read = false;
@@ -1228,6 +1228,7 @@ void loop()
   static long lastCleanup; 
   if (millis() - lastCleanup >= 1000) {
     terminal_ws.cleanupClients(2);
+    flash_ws.cleanupClients(2);
     lastCleanup = millis();
     delay(1);
   }
