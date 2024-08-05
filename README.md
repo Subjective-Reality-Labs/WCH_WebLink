@@ -14,6 +14,8 @@ To access the terminal and more flashing options press a little dot. If you hate
 
 By default Terminal uses SWIO debug interface for print in/out. If you prefer to use UART you can switch to it in the Settings menu. It will use the specified in ``platformio.ini`` Serial port at 115200 baud rate.
 
+You can also upload firmware with a simple HTTP POST multipart request. For example: ``curl -F 'offset=134217728' -F 'size=4380' -F 'firmware=@color_lcd.bin' weblink.local/flash``. Then you can use a GET request to ``weblink.local/status`` to get the result of the last operation. Using other functions like ``/unbrick`` and ``/reset`` is also possible of course.
+
 # Limitations and known issues
 - Tested on ESP32-C3 and base ESP32 only, other version _should_ work, but untested. If you will use one please add a suitable entry to ``platformio.ini`` if there is a need for any additional options.
 - Base ESP32 better handles terminal connection but may have some trouble while flashing, ESP32-C3 seems to be much more stable with flashing but sometimes skips characters in the terminal.
