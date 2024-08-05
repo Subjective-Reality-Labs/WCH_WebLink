@@ -24,27 +24,48 @@
 #define TERMINAL_BUFFER_SIZE 1024
 #define MAX_BINARY_SIZE 16384
 #define DEFAULT_FLASH_OFFSET 0x08000000
+#define FLASHER_OP_TIMEOUT 10000
 
-typedef enum SRLUpdateStatus {
-  IDLE,
-  UPLOADING,
-  UPDATING,
-  SUCCESS,
-  FAILED,
-} SRLUpdateStatus_t;
+#define HALT_MODE_HALT_AND_RESET    0
+#define HALT_MODE_REBOOT            1
+#define HALT_MODE_RESUME            2
+#define HALT_MODE_GO_TO_BOOTLOADER  3
+#define HALT_MODE_HALT_BUT_NO_RESET 5
 
-typedef enum SRLUpdateError {
-  UNKNOWN_ERROR,
-  UPLOAD_ERROR,
-  VERIFY_ERROR,
-  READ_ERROR,
-  UNPACK_ERROR,
-  UPDATER_ERROR,
-} SRLUpdateError_t;
+typedef enum WLFlasherStatus {
+  WLF_IDLE,
+  WLF_UPLOADING,
+  WLF_UPDATING,
+  WLF_SUCCESS,
+  WLF_FAILED,
+} WLFlasherStatus_t;
+
+typedef enum WLFlasherError {
+  WLF_UNKNOWN_ERROR,
+  WLF_UPLOAD_ERROR,
+  WLF_VERIFY_ERROR,
+  WLF_READ_ERROR,
+  WLF_UNPACK_ERROR,
+  WLF_UPDATER_ERROR,
+  WLF_TIMEOUT,
+} WLFlasherError_t;
+
+typedef enum WLFlasherCommand {
+  WLF_NONE,
+  WLF_INFO,
+  WLF_FLASH,
+  WLF_READ,
+  WLF_RESET,
+  WLF_HALT,
+  WLF_ERASE,
+  WLF_UNBRICK,
+  WLF_DEBUG,
+} WLFlasherCommand_t;
 
 ConfigG config;
 AsyncWebServer server(80);
 AsyncWebSocket terminal_ws("/terminal");
+AsyncWebSocket flash_ws("/wsflash");
 AsyncEventSource link_events = AsyncEventSource("/events");
 DNSServer dns_server;
 PersWiFiManagerAsync persWM(server, dns_server);
@@ -63,31 +84,44 @@ struct Terminal {
 } terminal;
 
 struct Flasher {
+  bool active = false;
   bool will_flash = false;
   bool will_unbrick = false;
+  bool will_read = false;
   uint32_t offset = 0;
   uint32_t size = 0;
   char message[64];
-  SRLUpdateError_t error;
-  SRLUpdateStatus_t status;
+  char name [64];
+  WLFlasherError_t error;
+  WLFlasherStatus_t status;
   uint8_t retries = 0;
   uint8_t current_retry = 0;
+  uint32_t watchdog = 0;
 } flasher;
+
+struct FlasherWS {
+  bool active = false;
+  WLFlasherCommand_t current_command = WLF_NONE;
+  AsyncWebSocketClient* client;
+  uint32_t watchdog = 0;
+} flasher_ws;
 
 TaskHandle_t PollTask;
 
 struct SWIOState link_state;
 uint8_t binary_buf[16384];
-bool upload_error;
+bool upload_post_error;
 
 int initLink();
 int writeBinary(uint32_t offset, uint32_t size);
 int unbrick();
+int chipInfo(char* buf);
 void pollTerminal(void *pvParameter);
 void handleFlasher();
 void parseMessage(char* message);
 void uartSetup();
 void terminalDisconnect();
+
 
 ////////////////////////////////
 ///   Server functions       ///
@@ -118,53 +152,85 @@ void onUpload(AsyncWebServerRequest *request, String filename, size_t index, uin
 void onFlashRequest(AsyncWebServerRequest *request) {
   // the request handler is triggered after the upload has finished... 
   // create the response, add header, and send response
-  AsyncWebServerResponse *response = request->beginResponse((upload_error)?500:200, "text/plain", (upload_error)?"FAIL":"OK");
+  AsyncWebServerResponse *response = request->beginResponse((upload_post_error)?500:200, "text/plain", (upload_post_error)?"FAIL":"OK");
   response->addHeader("Connection", "close");
   request->send(response);
-  if (!upload_error) {
+  if (!upload_post_error) {
     Serial.println("Upload ok");
   } else {
     Serial.println("Upload failed");
-    upload_error = false;
+    upload_post_error = false;
   }
 };
 
+void resetFlasher() {
+  flasher.active = false;
+  flasher_ws.active = false;
+  flasher.will_flash = false;
+  flasher.will_unbrick = false;
+  flasher.will_read = false;
+  flasher.offset = 0;
+  flasher.size = 0;
+  flasher.retries = 0;
+  flasher.current_retry = 0;
+  flasher_ws.current_command = WLF_NONE;
+}
+
+void activateFlasher(bool ws = false) {
+  flasher.active = true;
+  flasher_ws.active = ws;
+  flasher.watchdog = millis();
+}
+
+int resetCH() {
+  Serial.println("Resetting the board");
+  if(initLink() < 1) {
+    return 1;
+  } else {
+    HaltMode(&link_state, 1);
+    delay(10);
+    return 0;
+  }
+}
+
 void onFlashUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
-    //Upload handler chunks in data
-    // Serial.println("Upload requested");
-    int binary_size = request->getParam("size", true)->value().toInt();
+    
     if (!index) {
-      if (flasher.status == UPDATING || flasher.status == UPLOADING) {
-        upload_error = true;
+      // if (flasher.status == WLF_UPDATING || flasher.status == WLF_UPLOADING) {
+      if (millis() - flasher.watchdog < FLASHER_OP_TIMEOUT) resetFlasher();
+      if (flasher.active) {
+        upload_post_error = true;
         Serial.println("Flash in progress");
         return request->send(400, "text/plain", "Flash in progress");
       } else {
-        flasher.status = UPLOADING;
+        flasher.status = WLF_UPLOADING;
+        upload_post_error = false;
       }
-      upload_error = false;
       if (!request->hasParam("size", true)) {
-        upload_error = true;
-        flasher.error = UPLOAD_ERROR;
+        upload_post_error = true;
+        flasher.error = WLF_UPLOAD_ERROR;
         Serial.println("Size parameter missing.");
         return request->send(400, "text/plain", "Size parameter missing.");        
       }
+      int binary_size = request->getParam("size", true)->value().toInt();
       if (!request->hasParam("offset", true)) {
-        upload_error = true;
-        flasher.error = UPLOAD_ERROR;
+        upload_post_error = true;
+        flasher.error = WLF_UPLOAD_ERROR;
         Serial.print("Offset not specified");
         return request->send(400, "text/plain", "Offset parameter missing.");
       } else {
         flasher.offset = request->getParam("offset", true)->value().toInt();
       }
-      if (MAX_BINARY_SIZE < request->getParam("size", true)->value().toInt()) {
-        upload_error = true;
-        flasher.error = UPLOAD_ERROR;
+      if (MAX_BINARY_SIZE < binary_size) {
+        upload_post_error = true;
+        flasher.error = WLF_UPLOAD_ERROR;
         Serial.println("Binary is bigger then ch32v003 flash size.");
         return request->send(400, "text/plain", "Binary is too big.");
       } else {
-        flasher.size = request->getParam("size", true)->value().toInt();
+        flasher.size = binary_size;
       }
-      Serial.printf("Starting binary upload. size = %d\n", binary_size);
+      flasher.active = true;
+      Serial.printf("Starting binary upload. size = %d\n\r", binary_size);
     }
     if(len){
       memcpy(binary_buf+index, data, len);
@@ -175,17 +241,18 @@ void onFlashUpload(AsyncWebServerRequest *request, String filename, size_t index
     
     if (final) { // if the final flag is set then this is the last frame of data
       if (index+len != flasher.size) {
-        upload_error = true;
-        flasher.error = UPLOAD_ERROR;
-        flasher.status = FAILED;
+        upload_post_error = true;
+        flasher.error = WLF_UPLOAD_ERROR;
+        flasher.status = WLF_FAILED;
+        resetFlasher();
         sprintf(flasher.message, "Size mismatch, expected:%" PRIu32 ", actual:%d", flasher.size, (int)(index+len));
         Serial.println(flasher.message);
         link_events.send(flasher.message, "flasher", millis());
         return request->send(400, "text/plain", "Size mismatch");
       } else {
-        upload_error = false;
+        upload_post_error = false;
         flasher.will_flash = true;
-        flasher.status = UPDATING;
+        flasher.status = WLF_UPDATING;
         flasher.current_retry = 0;
         if (request->hasParam("retries", true)) {
           flasher.retries = request->getParam("retries", true)->value().toInt();
@@ -201,29 +268,29 @@ void onFlashUpload(AsyncWebServerRequest *request, String filename, size_t index
 
 void onStatus(AsyncWebServerRequest *request) {
   char reply[64];
-  if (flasher.status == IDLE) {
+  if (flasher.status == WLF_IDLE) {
     request->send(200, "text/plain", "Idle");
-  } else if (flasher.status == UPLOADING) {
+  } else if (flasher.status == WLF_UPLOADING) {
     request->send(200, "text/plain", "Uploading binary");
-  } else if (flasher.status == UPDATING) {
+  } else if (flasher.status == WLF_UPDATING) {
     sprintf(reply, "Flashing in progress. Retry: %u", flasher.current_retry);
     // %" PRIu32 "
     request->send(200, "text/plain", reply);
-  } else if (flasher.status == FAILED) {
+  } else if (flasher.status == WLF_FAILED) {
     request->send(200, "text/plain", "Flashing failed");
-  } else if (flasher.status == SUCCESS) {
+  } else if (flasher.status == WLF_SUCCESS) {
     request->send(200, "text/plain", "Successfully flashed");
   }
 }
 
-void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len)
+void onTerminalEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len)
 {
   // Handle WebSocket event
   switch (type) {
   case WS_EVT_CONNECT:
     // client connected
-    Serial.printf("ws[%s][%u] connect\n", server->url(), client->id());
-    client->printf("Hello Client %" PRIu32 " :)", client->id());
+    Serial.printf("ws[%s][%u] connect\n\r", server->url(), client->id());
+    client->printf("Hello Client %u" PRIu32 " :)", client->id());
     if (config.uart == false){
       if (initLink() > 0) {
         terminal.connected = true;
@@ -239,16 +306,16 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
     break;
   case WS_EVT_DISCONNECT:
     // client disconnected
-    Serial.printf("ws[%s][%" PRIu32 "] disconnect\n", server->url(), client->id());
+    Serial.printf("ws[%s][%" PRIu32 "] disconnect\n\r", server->url(), client->id());
     terminalDisconnect();
     break;
   case WS_EVT_ERROR:
     // error was received from the other end
-    Serial.printf("ws[%s][%" PRIu32 "] error(%u): %s\n", server->url(), client->id(), *((uint16_t *)arg), (char *)data);
+    Serial.printf("ws[%s][%" PRIu32 "] error(%u): %s\n\r", server->url(), client->id(), *((uint16_t *)arg), (char *)data);
     break;
   case WS_EVT_PONG:
     // pong message was received (in response to a ping request maybe)
-    Serial.printf("ws[%s][%" PRIu32 "] pong[%u]: %s\n", server->url(), client->id(), len, (len) ? (char *)data : "");
+    Serial.printf("ws[%s][%" PRIu32 "] pong[%u]: %s\n\r", server->url(), client->id(), len, (len) ? (char *)data : "");
     break;
   case WS_EVT_DATA:
     // data packet
@@ -257,18 +324,296 @@ void onEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType 
       // the whole message is in a single frame and we got all of it's data
       Serial.printf("ws[%s][%" PRIu32 "] %s-message[%llu]: ", server->url(), client->id(), (info->opcode == WS_TEXT) ? "text" : "binary", info->len);
       if (info->opcode == WS_TEXT && data[0] == 35) {
-        Serial.printf("%s. Sendind to terminal\n", (char *)data);
+        Serial.printf("%s. Sendind to terminal\n\r", (char *)data);
         if (terminal.incomming_buf[terminal.incomming_pos] == 0) {
           strncpy(terminal.incomming_buf, (char *)data+1, min(int(len-1), (int)sizeof(terminal.incomming_buf)));
         }
       } else  if (info->opcode == WS_TEXT) {
-        Serial.printf("%s\n", (char *)data);
+        Serial.printf("%s\n\r", (char *)data);
       } else {
         for (size_t i = 0; i < info->len; i++) {
           Serial.printf("%02x ", data[i]);
         }
-        Serial.print("\n");
+        Serial.print("\n\r");
       }
+    }
+    break;
+  }
+}
+
+void onFlasherEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len)
+{
+  // Handle WebSocket event
+  switch (type) {
+  case WS_EVT_CONNECT:
+    // client connected
+    Serial.printf("ws[%s][%u] flasher connect\n\r", server->url(), client->id());
+    client->printf("Welcome to WebLink flasher. Your id is %u" PRIu32 " :)", client->id());
+    break;
+  case WS_EVT_DISCONNECT:
+    // client disconnected
+    Serial.printf("ws[%s][%" PRIu32 "] flasher disconnect\n\r", server->url(), client->id());
+    break;
+  case WS_EVT_ERROR:
+    // error was received from the other end
+    Serial.printf("ws[%s][%" PRIu32 "] error(%u): %s\n\r", server->url(), client->id(), *((uint16_t *)arg), (char *)data);
+    break;
+  case WS_EVT_PONG:
+    // pong message was received (in response to a ping request maybe)
+    Serial.printf("ws[%s][%" PRIu32 "] pong[%u]: %s\n\r", server->url(), client->id(), len, (len) ? (char *)data : "");
+    break;
+  case WS_EVT_DATA:
+    // data packet
+    AwsFrameInfo *info = (AwsFrameInfo *)arg;
+    if (info->final && info->index == 0 && info->len == len) {
+      // the whole message is in a single frame and we got all of it's data
+      Serial.printf("ws[%s][%" PRIu32 "] %s-message[%llu]: ", server->url(), client->id(), (info->opcode == WS_TEXT) ? "text" : "binary", info->len);
+      if (info->opcode == WS_TEXT) {
+        Serial.printf("%s\n\r", (char *)data);
+        char buffer[64];
+        strncpy(buffer, (char *)data, 64);
+        // Serial.println(buffer);
+        if (buffer[0] == '#') {
+          Serial.printf("[ws] Got a command: %s\n\r", buffer);
+          if (flasher.active || flasher_ws.active) {
+            client->printf("#1;Flasher busy");
+            break;
+          }
+          if (initLink() < 1) {
+            client->text("#2;Failed to init link");
+            break;
+          };
+          flasher_ws.client = client;
+          activateFlasher(true);
+          switch (buffer[1])
+          {
+          case '3':
+          case '5':
+          case 't':
+          case 'f':
+          case 'U':
+            client->printf("#8;Unimplemented");
+            resetFlasher();
+            break;
+          case 'b': //reBoot
+            flasher_ws.current_command = WLF_RESET;
+            HaltMode(&link_state, HALT_MODE_REBOOT);
+            resetFlasher();
+            break;
+          case 'B': //reBoot into Bootloader
+            flasher_ws.current_command = WLF_RESET;
+            HaltMode(&link_state, HALT_MODE_GO_TO_BOOTLOADER);
+            client->text("#0;Reboted to bootloader");
+            resetFlasher();
+            break;
+          case 'e': //rEsume
+            flasher_ws.current_command = WLF_RESET;
+            HaltMode(&link_state, HALT_MODE_RESUME);
+            client->text("#0;Resumed");
+            resetFlasher();
+            break;
+          case 'a': //Reboot into Halt
+            flasher_ws.current_command = WLF_HALT;
+            HaltMode(&link_state, HALT_MODE_HALT_AND_RESET);
+            client->text("#0;Reboted to halt");
+            resetFlasher();
+            break;
+          case 'A': // Halt without reboot
+            flasher_ws.current_command = WLF_HALT;
+            HaltMode(&link_state, HALT_MODE_HALT_BUT_NO_RESET);
+            client->text("#0;Halted");
+            resetFlasher();
+            break;
+          case 'd': // disable NRST pin (turn it into a GPIO)
+            // HaltMode(&link_state, HALT_MODE_HALT_AND_RESET);
+            // ConfigureNRSTAsGPIO(&link_state, 0);
+            // client->text("#0;NRST disabled");
+            // resetFlasher();
+            // break;
+          case 'D':
+            // HaltMode(&link_state, HALT_MODE_HALT_AND_RESET);
+            // ConfigureNRSTAsGPIO(&link_state, 1);
+            // client->text("#0;NRST enabled");
+            // resetFlasher();
+            // break;
+          case 'p':
+            // HaltMode(&link_state, HALT_MODE_HALT_AND_RESET);
+            // ConfigureReadProtection(&link_state, 0);
+            // client->text("#0;Read protection off");
+            // resetFlasher();
+            // break;
+          case 'P':
+            // HaltMode(&link_state, HALT_MODE_HALT_AND_RESET);
+            // client->text("#0;Read protection on");
+            // ConfigureReadProtection(&link_state, 1);
+            client->text("#8;Unimplemented");
+            resetFlasher();
+          case 's':
+            char* token;
+            uint32_t datareg, value;
+            flasher_ws.current_command = WLF_DEBUG;
+            token = strtok(buffer, ";");
+            token = strtok(NULL, ";");
+            if (token == NULL) {
+              client->text("#3;Register missing");
+              resetFlasher();
+              break;
+            }
+            datareg = atoi(token);
+            token = strtok(NULL, ";");
+            if (token == NULL) {
+              client->text("#3;Value missing");
+              resetFlasher();
+              break;
+            }
+            value = atoi(token);
+            MCFWriteReg32(&link_state, datareg, value);
+            client->text("#0;Register written");
+            resetFlasher();
+            break;
+          case 'm':
+            char* token;
+            uint32_t datareg, value;
+            flasher_ws.current_command = WLF_DEBUG;
+            token = strtok(buffer, ";");
+            token = strtok(NULL, ";");
+            if (token == NULL) {
+              client->text("#3;Register missing");
+              resetFlasher();
+              break;
+            }
+            datareg = atoi(token);
+            int ret = MCFReadReg32(&link_state, datareg, &value);
+            client->printf("#0;%" PRIu32 ";%" PRIu32 ";%d", datareg, value, ret);
+            resetFlasher();
+            break;
+          case 'w':
+            char* token;
+            token = strtok(buffer, ";");
+            token = strtok(NULL, ";");
+            if (token == NULL) {
+              client->printf("#3;Offset missing");
+              resetFlasher();
+              break;
+            }
+            flasher.offset = atoi(token);
+            token = strtok(NULL, ";");
+            if (token == NULL) {
+              client->printf("#3;Size missing");
+              resetFlasher();
+              break;
+            }
+            flasher.size = atoi(token);
+            if (flasher.size > MAX_BINARY_SIZE) {
+              client->printf("#3;Binary is too big");
+              resetFlasher();
+              break;
+            }
+            token = strtok(NULL, ";");
+            if (token != NULL) {
+              flasher.retries = atoi(token);
+              token = strtok(NULL, ";");
+              if (token != NULL) strncpy(flasher.name, token, 64);
+            }
+            flasher.status = WLF_UPLOADING;
+            flasher_ws.current_command = WLF_FLASH;
+            client->printf("#0;Ready for upload");
+            break;
+          case 'r':
+            flasher_ws.current_command = WLF_READ;
+            client->printf("#8;Unimplemented");
+
+            char* token;
+            token = strtok(buffer, ";");
+            token = strtok(NULL, ";");
+            if (token == NULL) {
+              client->printf("#3;Offset missing");
+              resetFlasher();
+              break;
+            }
+            flasher.offset = atoi(token);
+            token = strtok(NULL, ";");
+            if (token == NULL) {
+              client->printf("#3;Size missing");
+              resetFlasher();
+              break;
+            }
+            flasher.size = atoi(token);
+            if(flasher.offset > 0xffffffff || flasher.size > 0xffffffff ) {
+            // if (flasher.size > MAX_BINARY_SIZE) {
+              client->printf("#3;Memory value request out of range");
+              resetFlasher();
+              break;
+            }
+            flasher.status = WLF_UPLOADING;
+            flasher_ws.current_command = WLF_READ;
+            client->printf("#0;Ready for download");
+            flasher.will_read = true;
+            break;
+          case 'u':
+            flasher_ws.current_command = WLF_UNBRICK;
+          case 'E':
+            flasher_ws.current_command = WLF_ERASE;
+            flasher.will_unbrick = true;
+            break;
+          case 'i':
+            flasher_ws.current_command = WLF_INFO;
+            char buffer[74];
+            if (chipInfo(buffer)) {
+              Serial.println("Failed to read info");
+              client->printf("#4;Failed to read info");
+            } else {
+              Serial.println(buffer);
+              client->text(buffer);
+            }
+            resetFlasher();
+            break;
+
+          default:
+            resetFlasher();
+            client->printf("#9;Unknown command");
+            break;
+          }
+        }
+      } else  if (info->opcode == WS_BINARY && flasher_ws.active && flasher.status == WLF_UPLOADING && client == flasher_ws.client) {
+        Serial.println("Got binary in one message");
+        flasher.watchdog = millis();
+        if (len == flasher.size) {
+          memcpy(binary_buf, data, len);
+          printf(flasher.message, "%d/%" PRIu32 "", (int)(len), flasher.size);
+          Serial.println(flasher.message);
+          flasher.will_flash = true;
+          flasher.status == WLF_UPDATING;
+          client->printf("#0;Will flash");
+        } else {
+          resetFlasher();
+          flasher.error = WLF_UPLOAD_ERROR;
+          flasher.status = WLF_FAILED;
+          client->printf("#4;Binary size mismatch");
+        }
+      }
+    } else if (info->opcode == WS_BINARY && flasher_ws.active && flasher.status == WLF_UPLOADING && client == flasher_ws.client) {
+      Serial.print("Got partial binary ");
+      Serial.printf("index=%llu; len=%u; \n\r", info->index, len);
+      flasher.watchdog = millis();
+      memcpy(binary_buf+info->index, data, len);
+      sprintf(flasher.message, "%" PRIu64 "/%" PRIu32 "", (info->index+len), info->len);
+      Serial.println(flasher.message);
+      if (info->index + len == info->len) {
+        Serial.println("Final");
+        if (info->len == flasher.size) {
+          flasher.will_flash = true;
+          flasher.status == WLF_UPDATING;
+          client->printf("#0;Will flash");
+        } else {
+          resetFlasher();
+          flasher.error = WLF_UPLOAD_ERROR;
+          flasher.status = WLF_FAILED;
+          client->printf("#4;Binary size mismatch");
+        }
+      }
+    } else {
+      Serial.println("Got something");
     }
     break;
   }
@@ -303,8 +648,10 @@ AsyncCallbackJsonWebHandler settings_handler = AsyncCallbackJsonWebHandler("/res
 
 void webServerSetup() {
   // attach AsyncWebSocket
-  terminal_ws.onEvent(onEvent);
+  terminal_ws.onEvent(onTerminalEvent);
+  flash_ws.onEvent(onFlasherEvent);
   server.addHandler(&terminal_ws);
+  server.addHandler(&flash_ws);
   server.addHandler(&link_events);
   server.addHandler(&settings_handler);
 
@@ -327,17 +674,16 @@ void webServerSetup() {
     request->send(200, "text/plain", String(ESP.getFreeHeap())); });
   
   server.on("/reset", HTTP_GET, [](AsyncWebServerRequest *request) { 
-    Serial.println("Resetting the board");
-    if(initLink() < 1) {
+    if(resetCH()) {
       request->send(200, "text/plain", "Failed to init");
     } else {
-      HaltMode(&link_state, 1);
-      delay(10);
       request->send(200, "text/plain", "OK");
     }
   });
   
   server.on("/unbrick", HTTP_GET, [](AsyncWebServerRequest *request) { 
+    flasher.active = true;
+    flasher.watchdog = millis();
     flasher.will_unbrick = true;
     if (config.pin3v3 < 0) {
       request->send(200, "text/plain", "Will erase");
@@ -351,7 +697,7 @@ void webServerSetup() {
 
   link_events.onConnect([](AsyncEventSourceClient *client){
     if(client->lastId()){
-      Serial.printf("Client reconnected! Last message ID that it got was: %u\n", client->lastId());
+      Serial.printf("Client reconnected! Last message ID that it got was: %u\n\r", client->lastId());
     }
     // send event with message "hello!", id current millis
     // and set reconnect delay to 1 second
@@ -478,11 +824,11 @@ int initLink() {
 	if( r >= 0 ) {
 		// Valid R.
 		if( reg == 0x00000000 || reg == 0xffffffff ) {
-			Serial.printf("Error: Setup chip failed. Got code %08x\n", reg );
+			Serial.printf("Error: Setup chip failed. Got code %08x\n\r", reg );
 			_status = -9;
 		} else {
       _status = 1;
-      Serial.printf("Got code %08x\n", reg );
+      Serial.printf("Got code %08x\n\r", reg );
     }
 
 	} else {
@@ -548,7 +894,7 @@ int unbrick() {
 		int r = MCFReadReg32( dev, DMSTATUS, &ds );
 		if( r )
     {
-   	  Serial.printf("Error: Could not read DMSTATUS from programmers (%d)\n", r);
+   	  Serial.printf("Error: Could not read DMSTATUS from programmers (%d)\n\r", r);
    	  return -99;
     }
 // 		MCF.FlushLLCommands( dev );
@@ -562,7 +908,7 @@ int unbrick() {
 	MCFWriteReg32( dev, DMCONTROL, 0x80000001 );
 
   int r = MCFReadReg32( dev, DMSTATUS, &ds );
-	Serial.printf("DMStatus After Halt: /%d/%08x\n", r, ds);
+	Serial.printf("DMStatus After Halt: /%d/%08x\n\r", r, ds);
 
 //  Many times we would clear the halt request, but in this case, we want to just leave it here, to prevent it from booting.
 //  TODO: Experiment and see if this is needed/wanted in cases.  NOTE: If you don't clear halt request, progarmmers can get stuck.
@@ -588,7 +934,7 @@ int unbrick() {
 }
 
 void pollTerminal(void *pvParameter) {
-  Serial.printf("Terminal polling is running on core %d\n", (int)xPortGetCoreID());
+  Serial.printf("Terminal polling is running on core %d\n\r", (int)xPortGetCoreID());
   uint32_t send_word = 0;
   while(true) {  
     if (terminal.connected) {
@@ -627,7 +973,7 @@ void pollTerminal(void *pvParameter) {
         r = MCFReadReg32( &link_state, DMDATA0, &rr );
 
         if(r != 0) {
-          Serial.printf("Terminal dead.  code %d\n", r );
+          Serial.printf("Terminal dead.  code %d\n\r", r );
           terminal_ws.closeAll();
           terminal.connected = false;
           send_word = 0;
@@ -658,6 +1004,42 @@ void pollTerminal(void *pvParameter) {
   }
 }
 
+int chipInfo(char* buf) {
+	uint32_t reg;
+  
+	HaltMode(&link_state, HALT_MODE_HALT_BUT_NO_RESET);
+	
+	if(ReadWord(&link_state, 0x1FFFF800, &reg ) ) goto fail;	
+	// printf( "USER/RDPR  : %04x/%04x\n", reg>>16, reg&0xFFFF );
+	sprintf(buf, "%04x;%04x;", reg>>16, reg&0xFFFF );
+	if(ReadWord(&link_state, 0x1FFFF804, &reg ) ) goto fail;	
+	// printf( "DATA1/DATA0: %04x/%04x\n", reg>>16, reg&0xFFFF );
+	sprintf(buf+10, "%04x;%04x;", reg>>16, reg&0xFFFF );
+	if(ReadWord(&link_state, 0x1FFFF808, &reg ) ) goto fail;	
+	// printf( "WRPR1/WRPR0: %04x/%04x\n", reg>>16, reg&0xFFFF );
+	sprintf(buf+20, "%04x;%04x;", reg>>16, reg&0xFFFF );
+	if(ReadWord(&link_state, 0x1FFFF80c, &reg ) ) goto fail;	
+	// printf( "WRPR3/WRPR2: %04x/%04x\n", reg>>16, reg&0xFFFF );
+	sprintf(buf+30, "%04x;%04x;", reg>>16, reg&0xFFFF );
+	if(ReadWord(&link_state, 0x1FFFF7E8, &reg ) ) goto fail;	
+	// printf( "R32_ESIG_UNIID1: %08x\n", reg );
+	sprintf(buf+40, "%08x;", reg );
+	if(ReadWord(&link_state, 0x1FFFF7EC, &reg ) ) goto fail;	
+	// printf( "R32_ESIG_UNIID2: %08x\n", reg );
+	sprintf(buf+49, "%08x;", reg );
+	if(ReadWord(&link_state, 0x1FFFF7F0, &reg ) ) goto fail;	
+	// printf( "R32_ESIG_UNIID3: %08x\n", reg );
+	sprintf(buf+58, "%08x;", reg );
+  if(ReadWord(&link_state, 0x1FFFF7E0, &reg ) ) goto fail;
+	// printf( "Flash Size: %d kB\n", (reg&0xffff) );
+	sprintf(buf+67, "%dkB", (reg&0xffff) );
+  HaltMode(&link_state, HALT_MODE_RESUME);
+	return 0;
+fail:
+	// Error: Failed to get chip details
+	return -11;
+}
+
 void handleFlasher() {
   if (flasher.will_flash || flasher.will_unbrick) {
     flasher.will_flash = !flasher.will_unbrick;
@@ -669,6 +1051,7 @@ void handleFlasher() {
     flasher.will_flash = false;
     int flash_result;
     for (flasher.current_retry = 0; flasher.current_retry <= flasher.retries; flasher.current_retry++) {
+      flasher.watchdog = millis();
       flash_result = writeBinary(flasher.offset, flasher.size);
       if (!flash_result) break;
     }
@@ -678,30 +1061,50 @@ void handleFlasher() {
       } else {
         sprintf(flasher.message, "Flashing failed: %d", flash_result);
       }
-      flasher.error = UPDATER_ERROR;
-      flasher.status = FAILED;
+      flasher.error = WLF_UPDATER_ERROR;
+      flasher.status = WLF_FAILED;
     } else {
       sprintf(flasher.message, "Flashed succesfully");
-      flasher.status = SUCCESS;
+      flasher.status = WLF_SUCCESS;
     }
     Serial.println(flasher.message);
     link_events.send(flasher.message, "flasher", millis());
+    // if (flasher_ws.active) flasher_ws.client->text(flasher.message);
+    if (flasher_ws.active) flasher_ws.client->printf("#%d;%s;", flash_result?0:4, flasher.message);
+    resetFlasher();
   } else if (flasher.will_unbrick) {
     flasher.will_unbrick = false;
+    flasher.watchdog = millis();
+    int r;
     if (config.pin3v3 < 0) {
       initLink();
       HaltMode(&link_state, 0);
       delay(10);
-      int r = EraseFlash(&link_state, 0, 0, 1);
+      r = EraseFlash(&link_state, 0, 0, 1);
       if (r) sprintf(flasher.message, "Erase failed: %d", r);
       else strcpy(flasher.message, "Success! Flash erased!");
     } else {
-      int r = unbrick();
+      r = unbrick();
       if (r) sprintf(flasher.message, "Unbrick failed: %d", r);
       else strcpy(flasher.message, "Success! Unbrick completed.");
     }
     link_events.send(flasher.message, "flasher", millis());
     Serial.println(flasher.message);
+    if (flasher_ws.active) flasher_ws.client->printf("#%d;%s;", r?0:4, flasher.message);
+    resetFlasher();
+  } else if (flasher.will_read) {
+    flasher.will_read = false;
+    flasher.watchdog = millis();
+    int read_result = ReadBinaryBlob(&link_state, flasher.offset, flasher.size, binary_buf);
+    if (read_result) {
+      Serial.println("Failed to read flash");
+      if (flasher_ws.active) {
+        flasher_ws.client->text("#4;Failed to read flash");
+      }
+    } else {
+      if (flasher_ws.active) flasher_ws.client->binary(binary_buf, flasher.size);
+    }
+    resetFlasher();
   }
 }
 
@@ -755,12 +1158,12 @@ void wifiSetup() {
   persWM.onConnect([](){ 
     server.onNotFound(onRequest);
     mdnsSetup();
-    Serial.printf("This IP: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("This IP: %s\n\r", WiFi.localIP().toString().c_str());
     });
   //...or AP mode is started
   persWM.onAp([]() {
     AP_active = true;
-    Serial.printf("AP name: %s\n", persWM.getApSsid().c_str());
+    Serial.printf("AP name: %s\n\r", persWM.getApSsid().c_str());
     server.onNotFound(onRequest);
     mdnsSetup(); 
     });
@@ -835,6 +1238,11 @@ void loop()
       strcpy(terminal.buf, "#");
       terminal.last_send_time = millis();
     }
+  }
+  if (millis() - flasher.watchdog > FLASHER_OP_TIMEOUT) {
+    flasher.status = WLF_FAILED;
+    flasher.error = WLF_TIMEOUT;
+    resetFlasher();
   }
   delay(1);
   handleFlasher();
