@@ -14,8 +14,39 @@ To access the terminal and more flashing options press a little dot. If you hate
 
 By default Terminal uses SWIO debug interface for print in/out. If you prefer to use UART you can switch to it in the Settings menu. It will use the specified in ``platformio.ini`` Serial port at 115200 baud rate.
 
-You can also upload firmware with a simple HTTP POST multipart request. For example: ``curl -F 'offset=134217728' -F 'size=4380' -F 'firmware=@color_lcd.bin' weblink.local/flash``. Then you can use a GET request to ``weblink.local/status`` to get the result of the last operation. Using other functions like ``/unbrick`` and ``/reset`` is also possible of course.
+You can also upload firmware with a simple HTTP POST multipart request. For example: ``curl -F 'offset=134217728' -F 'size=4300' -F 'firmware=@color_lcd.bin' weblink.local/flash``. Then you can use a GET request to ``weblink.local/status`` to get the result of the last operation. Using other functions like ``/unbrick`` and ``/reset`` is also possible of course.
 
+# WebSocket API
+WebLink can also act as a minichlink replacement/addition. At the endpoint ``/wsflash`` you can use WebSocket to perform most of minichlink's [functions](https://github.com/cnlohr/ch32v003fun/tree/master/minichlink).
+Format your message like this: ``#command;argument;second argument``. WebLink uses the same command/argument pattern as minichlink. The exceptions are the write ``#w`` and read ``#r`` commands.
+
+Write command: ``#w;offset;size;retries;name``. All integers should be in decimal format. "Retries" is how many times to try to write to flash if it fails. "Name" is currently unused. "Retries" and "name" arguments are optional and can be omitted.
+
+Write command requires two messages. First one is a text message for example ``#w;134217728;4300;3;color_lcd``, then you have to send a binary message which contains an actual program that will be flashed to an MCU.
+All commands should start with ``#`` other messages will be ignored. All commands sent to WebLink will receive a reply in the format ``#reply code;reply message`` for example this is what binary upload would look like:
+```
+> #w;134217728;4300;3;color_lcd
+> #0;Ready for upload
+> binary message
+> #0;Will flash
+> #0;Flashed successfully
+```
+Read command: ``r;offset;ammount;``. Response will be like this:
+```
+> #0;Ready to download
+> binary message with flash content
+```
+Response codes are:
+```
+#0 - command successful
+#1 - flasher busy
+#2 - link init failed
+#3 - command argument bad/missing
+#4 - command failed
+#8 - command unimplemented
+#9 - unknown command
+```
+**Note:** when a client sends a command to ``/wsflash`` all connections to ``/terminal`` are closed.
 # Limitations and known issues
 - Tested on ESP32-C3 and base ESP32 only, other version _should_ work, but untested. If you will use one please add a suitable entry to ``platformio.ini`` if there is a need for any additional options.
 - Base ESP32 better handles terminal connection but may have some trouble while flashing, ESP32-C3 seems to be much more stable with flashing but sometimes skips characters in the terminal.
